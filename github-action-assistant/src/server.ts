@@ -1,5 +1,10 @@
 import { createWorkersAI } from "workers-ai-provider";
-import { callable, routeAgentRequest, type Schedule } from "agents";
+import {
+  callable,
+  getAgentByName,
+  routeAgentRequest,
+  type Schedule
+} from "agents";
 import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
 import {
@@ -11,7 +16,24 @@ import {
 } from "ai";
 import { z } from "zod";
 
-export class ChatAgent extends AIChatAgent<Env> {
+interface WorkflowRunSummary {
+  action?: string;
+  repo?: string;
+  workflowName?: string;
+  runId?: number;
+  runNumber?: number;
+  status?: string;
+  conclusion?: string | null;
+  htmlUrl?: string;
+  headSha?: string;
+  updatedAt?: string;
+}
+
+interface ChatAgentState {
+  workflowRuns: WorkflowRunSummary[];
+}
+
+export class ChatAgent extends AIChatAgent<Env, ChatAgentState> {
   maxPersistedMessages = 100;
   chatRecovery = true;
   // Wait for MCP connections to be re-established after hibernation before
@@ -51,7 +73,7 @@ export class ChatAgent extends AIChatAgent<Env> {
     const workersai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
+      model: workersai("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
         sessionAffinity: this.sessionAffinity
       }),
       system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
@@ -186,6 +208,12 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
     return result.toUIMessageStreamResponse();
   }
 
+  async recordWorkflowRun(run: WorkflowRunSummary) {
+    const existing = this.state?.workflowRuns ?? [];
+    this.setState({ workflowRuns: [run, ...existing].slice(0, 20) });
+    this.broadcast(JSON.stringify({ type: "workflow-run", run }));
+  }
+
   async executeTask(description: string, _task: Schedule<string>) {
     // Do the actual work here (send email, call API, etc.)
     console.log(`Executing scheduled task: ${description}`);
@@ -204,8 +232,124 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
   }
 }
 
+const GITHUB_WEBHOOK_PATH = "/webhook";
+
+async function verifyGitHubSignature(
+  secret: string,
+  rawBody: string,
+  signatureHeader: string | null
+): Promise<boolean> {
+  if (!signatureHeader?.startsWith("sha256=")) return false;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const mac = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(rawBody)
+  );
+  const expected = `sha256=${[...new Uint8Array(mac)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")}`;
+  if (expected.length !== signatureHeader.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < expected.length; i++) {
+    mismatch |= expected.charCodeAt(i) ^ signatureHeader.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
+function parseGitHubPayload(rawBody: string, contentType: string) {
+  if (contentType.includes("application/json")) {
+    return JSON.parse(rawBody);
+  }
+  // GitHub webhook configured with content type "form" sends the JSON
+  // payload URL-encoded under a single "payload" field.
+  const encoded = new URLSearchParams(rawBody).get("payload");
+  if (!encoded) throw new Error("Missing payload field in form body");
+  return JSON.parse(encoded);
+}
+
+async function handleGitHubWebhook(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const rawBody = await request.text();
+  const valid = await verifyGitHubSignature(
+    env.GITHUB_WEBHOOK_SECRET,
+    rawBody,
+    request.headers.get("X-Hub-Signature-256")
+  );
+  if (!valid) {
+    console.error("GitHub webhook: signature verification failed");
+    return new Response("Invalid signature", { status: 401 });
+  }
+
+  const event = request.headers.get("X-Github-Event");
+  console.log(`GitHub webhook: received event=${event}`);
+
+  if (event === "ping") {
+    return new Response("pong", { status: 200 });
+  }
+
+  if (event === "workflow_run") {
+    let payload: {
+      action?: string;
+      repository?: { full_name?: string };
+      workflow_run?: {
+        id?: number;
+        run_number?: number;
+        name?: string;
+        status?: string;
+        conclusion?: string | null;
+        html_url?: string;
+        head_sha?: string;
+        updated_at?: string;
+      };
+    };
+    try {
+      payload = parseGitHubPayload(
+        rawBody,
+        request.headers.get("content-type") ?? ""
+      );
+    } catch (error) {
+      console.error("GitHub webhook: failed to parse payload", error);
+      return new Response("Bad payload", { status: 400 });
+    }
+
+    const run = payload.workflow_run;
+    const agent = await getAgentByName(env.ChatAgent, "github-monitor");
+    await agent.recordWorkflowRun({
+      action: payload.action,
+      repo: payload.repository?.full_name,
+      workflowName: run?.name,
+      runId: run?.id,
+      runNumber: run?.run_number,
+      status: run?.status,
+      conclusion: run?.conclusion,
+      htmlUrl: run?.html_url,
+      headSha: run?.head_sha,
+      updatedAt: run?.updated_at
+    });
+    console.log(
+      `GitHub webhook: recorded workflow_run ${run?.id} (${run?.status}/${run?.conclusion})`
+    );
+  }
+
+  return new Response("ok", { status: 200 });
+}
+
 export default {
   async fetch(request: Request, env: Env) {
+    const url = new URL(request.url);
+    if (url.pathname === GITHUB_WEBHOOK_PATH && request.method === "POST") {
+      return handleGitHubWebhook(request, env);
+    }
+
     return (
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })
