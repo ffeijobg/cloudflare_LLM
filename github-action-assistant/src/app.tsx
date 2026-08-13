@@ -4,6 +4,7 @@ import { useAgentChat } from "@cloudflare/ai-chat/react";
 import { getToolName, isToolUIPart, type UIMessage } from "ai";
 import type { MCPServersState } from "agents";
 import type { ChatAgent } from "./server";
+import { CORRECTION_MARKER } from "./shared";
 import {
   Badge,
   Button,
@@ -47,6 +48,22 @@ interface Attachment {
   file: File;
   preview: string;
   mediaType: string;
+}
+
+// The server injects a synthetic role:"user" message (see
+// buildCorrectionMessage in server.ts) to hand a salvaged tool result back
+// to the model — it carries a raw JSON dump and is meant to be invisible
+// plumbing, not something to show as if the user typed it.
+function isCorrectionMessage(message: UIMessage): boolean {
+  if (message.role !== "user") return false;
+  const text = message.parts
+    .filter(
+      (part): part is Extract<UIMessage["parts"][number], { type: "text" }> =>
+        part.type === "text"
+    )
+    .map((part) => part.text)
+    .join("");
+  return text.startsWith(CORRECTION_MARKER);
 }
 
 function createAttachment(file: File): Attachment {
@@ -360,21 +377,13 @@ function Chat() {
     status
   } = useAgentChat({
     agent,
-    experimental_throttle: 100,
-    onToolCall: async ({ toolCall, addToolOutput }) => {
-      if (toolCall.toolName === "getUserTimezone") {
-        addToolOutput({
-          toolCallId: toolCall.toolCallId,
-          output: {
-            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-            localTime: new Date().toLocaleTimeString()
-          }
-        });
-      }
-    }
+    experimental_throttle: 100
   });
 
   const isStreaming = status === "streaming" || status === "submitted";
+  const visibleMessages = messages.filter(
+    (message) => !isCorrectionMessage(message)
+  );
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -697,17 +706,17 @@ function Chat() {
       {/* Messages */}
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto px-5 py-6 space-y-5">
-          {messages.length === 0 && (
+          {visibleMessages.length === 0 && (
             <Empty
               icon={<ChatCircleDotsIcon size={32} />}
               title="Start a conversation"
               contents={
                 <div className="flex flex-wrap justify-center gap-2">
                   {[
-                    "What's the weather in Paris?",
-                    "What timezone am I in?",
-                    "Calculate 5000 * 3",
-                    "Remind me in 5 minutes to take a break"
+                    "What's the status of the latest workflow run?",
+                    "Which step was slow in the last build?",
+                    "How many workflows succeeded today?",
+                    "Why did the last run fail?"
                   ].map((prompt) => (
                     <Button
                       key={prompt}
@@ -729,10 +738,11 @@ function Chat() {
             />
           )}
 
-          {messages.map((message: UIMessage, index: number) => {
+          {visibleMessages.map((message: UIMessage, index: number) => {
             const isUser = message.role === "user";
             const isLastAssistant =
-              message.role === "assistant" && index === messages.length - 1;
+              message.role === "assistant" &&
+              index === visibleMessages.length - 1;
 
             return (
               <div key={message.id} className="space-y-2">
