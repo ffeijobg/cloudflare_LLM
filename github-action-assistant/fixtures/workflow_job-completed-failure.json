@@ -1,0 +1,41 @@
+{
+  "action": "completed",
+  "workflow_job": {
+    "id": 88880002,
+    "run_id": 99990002,
+    "name": "greet",
+    "workflow_name": "Greetings",
+    "status": "completed",
+    "conclusion": "failure",
+    "html_url": "https://github.com/ffeijobg/cloudflare_LLM/actions/runs/99990002/job/88880002",
+    "steps": [
+      {
+        "name": "Set up job",
+        "status": "completed",
+        "conclusion": "success",
+        "number": 1,
+        "started_at": "2026-08-14T10:05:06Z",
+        "completed_at": "2026-08-14T10:05:08Z"
+      },
+      {
+        "name": "Checkout",
+        "status": "completed",
+        "conclusion": "success",
+        "number": 2,
+        "started_at": "2026-08-14T10:05:08Z",
+        "completed_at": "2026-08-14T10:05:12Z"
+      },
+      {
+        "name": "Say hello",
+        "status": "completed",
+        "conclusion": "failure",
+        "number": 3,
+        "started_at": "2026-08-14T10:05:12Z",
+        "completed_at": "2026-08-14T10:05:16Z"
+      }
+    ]
+  },
+  "repository": {
+    "full_name": "ffeijobg/cloudflare_LLM"
+  }
+}

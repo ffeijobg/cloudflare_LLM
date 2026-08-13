@@ -1,0 +1,16 @@
+{
+  "action": "completed",
+  "workflow_run": {
+    "id": 99990002,
+    "run_number": 102,
+    "name": "Greetings",
+    "status": "completed",
+    "conclusion": "failure",
+    "html_url": "https://github.com/ffeijobg/cloudflare_LLM/actions/runs/99990002",
+    "head_sha": "fixture0000000000000000000000000000002",
+    "updated_at": "2026-08-14T10:05:30Z"
+  },
+  "repository": {
+    "full_name": "ffeijobg/cloudflare_LLM"
+  }
+}

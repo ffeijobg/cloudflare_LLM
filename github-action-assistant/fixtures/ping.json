@@ -1,0 +1,13 @@
+{
+  "zen": "Speak like a human.",
+  "hook_id": 123456,
+  "hook": {
+    "type": "Repository",
+    "id": 123456,
+    "active": true,
+    "events": ["workflow_run", "workflow_job"]
+  },
+  "repository": {
+    "full_name": "ffeijobg/cloudflare_LLM"
+  }
+}
