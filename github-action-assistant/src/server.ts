@@ -568,7 +568,17 @@ export class ChatAgent extends AIChatAgent<Env, ChatAgentState> {
         description:
           "Get recent GitHub Actions workflow run results (status, conclusion, workflow name, repo, commit) recorded from the GitHub webhook. Use this to diagnose CI failures or slow pipelines before answering.",
         inputSchema: z.object({
-          limit: z
+          // z.coerce so a numeric-looking string (the model sends
+          // {"limit":"1"} under forced toolChoice often enough to matter)
+          // still validates. Without this, workers-ai-provider's own
+          // forced-tool-call text-recovery re-emits the leaked call with the
+          // string arg untouched, fails our schema, and the client renders
+          // that failed attempt as a visible error — even though our
+          // separate onFinish salvage then coerces and succeeds a moment
+          // later. Accepting the string here lets the provider's own
+          // recovery succeed on the first try instead of needing our
+          // fallback at all.
+          limit: z.coerce
             .number()
             .int()
             .min(1)
@@ -593,14 +603,16 @@ export class ChatAgent extends AIChatAgent<Env, ChatAgentState> {
         description:
           "Get step-level timing for recent GitHub Actions jobs: per-step duration in seconds, status, a trend (average duration and whether the step regressed vs its own history) when enough history exists, and (for a failed or timed-out step) a tail excerpt of the job's raw log. Use this to identify which specific step is slow, whether a slow step is a one-off or a regression, or to diagnose why a step failed — getGithubWorkflowRuns only gives overall run status, not step detail. Pass runId (from getGithubWorkflowRuns) to see only the jobs for that specific run.",
         inputSchema: z.object({
-          limit: z
+          // z.coerce for the same reason as getGithubWorkflowRuns.limit —
+          // the model sends numeric args as strings often enough to matter.
+          limit: z.coerce
             .number()
             .int()
             .min(1)
             .max(10)
             .optional()
             .describe("Max number of recent jobs to return (default 10)"),
-          runId: z
+          runId: z.coerce
             .number()
             .int()
             .optional()
