@@ -16,14 +16,7 @@
     {
       "binding": "DB",
       "database_name": "github-action-assistant-db",
-      // Replace with the id printed by `wrangler d1 create github-action-assistant-db`.
       "database_id": "200e30c9-fd8e-4fb7-a6d6-ecb9c6378df3"
-    },
-    {
-      "binding": "github_action_assistant_db",
-      "database_name": "github-action-assistant-db",
-      "database_id": "200e30c9-fd8e-4fb7-a6d6-ecb9c6378df3",
-      "remote": true
     }
   ],
   "assets": {

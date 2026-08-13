@@ -381,3 +381,99 @@ export async function getStepTrend(
     isRegression: currentDurationSeconds > average * REGRESSION_FACTOR
   };
 }
+
+// ── Trend view (chat UI) ──
+//
+// A compact overview across the most recently active (repo, workflow, step)
+// combinations, for the chat UI's Trends panel — distinct from getStepTrend
+// above, which answers "is this one specific run's duration a regression."
+// Includes every recorded status (not just successes), since this is a
+// general activity view rather than a regression baseline.
+
+export interface StepTrendSeries {
+  repo: string;
+  workflow: string;
+  step: string;
+  // Oldest → newest; the last entry is the most recent run.
+  durations: number[];
+  latestDurationSeconds: number;
+  averageDurationSeconds: number;
+  isRegression: boolean;
+  sampleSize: number;
+  latestStatus: string | null;
+  latestTimestamp: string;
+}
+
+const TREND_PANEL_STEP_LIMIT = 8;
+const TREND_PANEL_SAMPLE_LIMIT = 10;
+
+export async function getRecentStepTrends(
+  db: D1Database
+): Promise<StepTrendSeries[]> {
+  const groups = await db
+    .prepare(
+      `SELECT repo, workflow, step, MAX(timestamp) AS latest_timestamp, COUNT(*) AS sample_size
+       FROM step_runs
+       WHERE duration_seconds IS NOT NULL
+       GROUP BY repo, workflow, step
+       ORDER BY latest_timestamp DESC
+       LIMIT ?`
+    )
+    .bind(TREND_PANEL_STEP_LIMIT)
+    .all<{
+      repo: string;
+      workflow: string;
+      step: string;
+      latest_timestamp: string;
+      sample_size: number;
+    }>();
+
+  return Promise.all(
+    (groups.results ?? []).map(async (group) => {
+      const rows = await db
+        .prepare(
+          `SELECT duration_seconds, status, timestamp FROM step_runs
+           WHERE repo = ? AND workflow = ? AND step = ? AND duration_seconds IS NOT NULL
+           ORDER BY timestamp DESC
+           LIMIT ?`
+        )
+        .bind(group.repo, group.workflow, group.step, TREND_PANEL_SAMPLE_LIMIT)
+        .all<{
+          duration_seconds: number;
+          status: string | null;
+          timestamp: string;
+        }>();
+      // Query is newest-first (for the LIMIT to keep the *recent* N); the
+      // panel reads left-to-right as oldest-to-newest, so reverse it here.
+      const recent = (rows.results ?? []).slice().reverse();
+      const durations = recent.map((row) => row.duration_seconds);
+      const latest = recent[recent.length - 1];
+      const priorDurations = durations.slice(0, -1);
+      const average =
+        durations.reduce((sum, d) => sum + d, 0) / (durations.length || 1);
+      const priorAverage =
+        priorDurations.length > 0
+          ? priorDurations.reduce((sum, d) => sum + d, 0) /
+            priorDurations.length
+          : average;
+
+      return {
+        repo: group.repo,
+        workflow: group.workflow,
+        step: group.step,
+        durations,
+        latestDurationSeconds: latest?.duration_seconds ?? 0,
+        averageDurationSeconds: Math.round(average),
+        // Same MIN_SAMPLES_FOR_TREND/REGRESSION_FACTOR rule as getStepTrend,
+        // so the panel and the chat tool never disagree about what counts
+        // as a regression.
+        isRegression:
+          priorDurations.length >= MIN_SAMPLES_FOR_TREND &&
+          (latest?.duration_seconds ?? 0) > priorAverage * REGRESSION_FACTOR,
+        sampleSize: group.sample_size,
+        latestStatus: latest?.status ?? null,
+        latestTimestamp: latest?.timestamp ?? group.latest_timestamp
+      };
+    })
+  );
+}

@@ -4,6 +4,7 @@ import { useAgentChat } from "@cloudflare/ai-chat/react";
 import { getToolName, isToolUIPart, type UIMessage } from "ai";
 import type { MCPServersState } from "agents";
 import type { ChatAgent } from "./server";
+import type { StepTrendSeries } from "./github";
 import { CORRECTION_MARKER } from "./shared";
 import {
   Badge,
@@ -38,7 +39,10 @@ import {
   XIcon,
   WrenchIcon,
   PaperclipIcon,
-  ImageIcon
+  ImageIcon,
+  ChartLineUpIcon,
+  ArrowClockwiseIcon,
+  WarningIcon
 } from "@phosphor-icons/react";
 
 // ── Attachment helpers ────────────────────────────────────────────────
@@ -108,6 +112,74 @@ function ThemeToggle() {
       onClick={toggle}
       aria-label="Toggle theme"
     />
+  );
+}
+
+// ── Trend view (D1-backed, via agent.stub.getStepTrends) ───────────────
+
+function TrendSeriesRow({ series }: { series: StepTrendSeries }) {
+  const maxDuration = Math.max(...series.durations, 1);
+  return (
+    <div className="p-2.5 rounded-lg border border-kumo-line">
+      <div className="flex items-start justify-between gap-2 mb-2">
+        <div className="min-w-0 flex-1">
+          <span className="text-sm font-medium text-kumo-default truncate block">
+            {series.step}
+          </span>
+          <span className="text-xs text-kumo-subtle truncate block mt-0.5">
+            {series.workflow} · {series.repo}
+          </span>
+        </div>
+        {series.isRegression && (
+          <Badge variant="destructive" className="shrink-0">
+            <WarningIcon size={10} className="mr-0.5" />
+            Regression
+          </Badge>
+        )}
+      </div>
+
+      {/* Sparkline: oldest -> newest, one bar per recorded run. Decorative —
+          the same numbers (latest/avg/sample count) are always rendered as
+          real text just below, so screen readers get the data from there
+          rather than from a synthesized description of the bars. */}
+      <div className="flex items-end gap-0.5 h-7 mb-2" aria-hidden="true">
+        {series.durations.map((duration, i) => {
+          const isLatest = i === series.durations.length - 1;
+          const heightPct = Math.max(
+            10,
+            Math.round((duration / maxDuration) * 100)
+          );
+          return (
+            <div
+              // Sparkline bars are a fixed-length, order-only array with no
+              // stable id — index is the correct key here.
+              // eslint-disable-next-line react/no-array-index-key
+              key={i}
+              title={`${duration}s`}
+              className={
+                "flex-1 rounded-t-sm " +
+                (isLatest && series.isRegression
+                  ? "bg-kumo-danger"
+                  : isLatest
+                    ? "bg-kumo-brand"
+                    : "bg-kumo-brand/40")
+              }
+              style={{ height: `${heightPct}%` }}
+            />
+          );
+        })}
+      </div>
+
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-kumo-subtle">
+          Latest {series.latestDurationSeconds}s · Avg{" "}
+          {series.averageDurationSeconds}s
+        </span>
+        <span className="text-xs text-kumo-subtle">
+          {series.sampleSize} run{series.sampleSize !== 1 ? "s" : ""}
+        </span>
+      </div>
+    </div>
   );
 }
 
@@ -297,6 +369,11 @@ function Chat() {
   const [mcpUrl, setMcpUrl] = useState("");
   const [isAddingServer, setIsAddingServer] = useState(false);
   const mcpPanelRef = useRef<HTMLDivElement>(null);
+  const [showTrendsPanel, setShowTrendsPanel] = useState(false);
+  const [trendSeries, setTrendSeries] = useState<StepTrendSeries[]>([]);
+  const [isLoadingTrends, setIsLoadingTrends] = useState(false);
+  const [trendsError, setTrendsError] = useState<string | null>(null);
+  const trendsPanelRef = useRef<HTMLDivElement>(null);
 
   const agent = useAgent<ChatAgent>({
     agent: "ChatAgent",
@@ -342,6 +419,41 @@ function Chat() {
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [showMcpPanel]);
+
+  // Close Trends panel when clicking outside
+  useEffect(() => {
+    if (!showTrendsPanel) return;
+    function handleClickOutside(e: MouseEvent) {
+      if (
+        trendsPanelRef.current &&
+        !trendsPanelRef.current.contains(e.target as Node)
+      ) {
+        setShowTrendsPanel(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showTrendsPanel]);
+
+  const fetchTrends = useCallback(async () => {
+    setIsLoadingTrends(true);
+    setTrendsError(null);
+    try {
+      const series = await agent.stub.getStepTrends();
+      setTrendSeries(series);
+    } catch (e) {
+      console.error("Failed to load trend data:", e);
+      setTrendsError("Couldn't load trend data. Try again.");
+    } finally {
+      setIsLoadingTrends(false);
+    }
+  }, [agent]);
+
+  const handleToggleTrendsPanel = () => {
+    const next = !showTrendsPanel;
+    setShowTrendsPanel(next);
+    if (next) fetchTrends();
+  };
 
   const handleAddServer = async () => {
     if (!mcpName.trim() || !mcpUrl.trim()) return;
@@ -692,6 +804,95 @@ function Chat() {
                 </div>
               )}
             </div>
+
+            <div className="relative" ref={trendsPanelRef}>
+              <Button
+                variant="secondary"
+                icon={<ChartLineUpIcon size={16} />}
+                onClick={handleToggleTrendsPanel}
+              >
+                Trends
+              </Button>
+
+              {/* Trends Dropdown Panel */}
+              {showTrendsPanel && (
+                <div className="absolute right-0 top-full mt-2 w-[26rem] z-50">
+                  <Surface className="rounded-xl ring ring-kumo-line shadow-lg p-4 space-y-3">
+                    {/* Panel Header */}
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <ChartLineUpIcon
+                          size={16}
+                          className="text-kumo-accent"
+                        />
+                        <Text size="sm" bold>
+                          Step Duration Trends
+                        </Text>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          shape="square"
+                          aria-label="Refresh trends"
+                          icon={
+                            <ArrowClockwiseIcon
+                              size={14}
+                              className={isLoadingTrends ? "animate-spin" : ""}
+                            />
+                          }
+                          onClick={fetchTrends}
+                          disabled={isLoadingTrends}
+                        />
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          shape="square"
+                          aria-label="Close trends panel"
+                          icon={<XIcon size={14} />}
+                          onClick={() => setShowTrendsPanel(false)}
+                        />
+                      </div>
+                    </div>
+
+                    {trendsError && (
+                      <span className="text-xs text-kumo-danger block">
+                        {trendsError}
+                      </span>
+                    )}
+
+                    {!trendsError &&
+                      isLoadingTrends &&
+                      trendSeries.length === 0 && (
+                        <span className="text-xs text-kumo-subtle block">
+                          Loading…
+                        </span>
+                      )}
+
+                    {!trendsError &&
+                      !isLoadingTrends &&
+                      trendSeries.length === 0 && (
+                        <span className="text-xs text-kumo-subtle block">
+                          No step duration history yet — this fills in once a
+                          few GitHub Actions jobs have completed.
+                        </span>
+                      )}
+
+                    {trendSeries.length > 0 && (
+                      <div className="space-y-2 max-h-96 overflow-y-auto">
+                        {trendSeries.map((series) => (
+                          <TrendSeriesRow
+                            key={`${series.repo}/${series.workflow}/${series.step}`}
+                            series={series}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </Surface>
+                </div>
+              )}
+            </div>
+
             <Button
               variant="secondary"
               icon={<TrashIcon size={16} />}
