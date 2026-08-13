@@ -1,4 +1,4 @@
-# Agent Starter
+# Automation support agent
 
 ![npm i agents command](./npm-agents-banner.svg)
 

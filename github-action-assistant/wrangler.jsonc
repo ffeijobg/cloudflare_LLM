@@ -39,6 +39,13 @@
       }
     ]
   },
+  "workflows": [
+    {
+      "binding": "GITHUB_RUN_WORKFLOW",
+      "name": "github-run-workflow",
+      "class_name": "GithubRunWorkflow"
+    }
+  ],
   "migrations": [
     {
       "new_sqlite_classes": ["ChatAgent"],
