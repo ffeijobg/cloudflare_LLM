@@ -1,244 +1,215 @@
-# Automation support agent
+# GitHub Actions Assistant
 
-![npm i agents command](./npm-agents-banner.svg)
+A GitHub Actions CI/CD monitoring chatbot built on Cloudflare (Workers, Workflows,
+Workers AI, D1, Durable Objects). It listens to GitHub Actions webhook deliveries,
+parses and categorizes each job, generates an automated diagnosis for anything
+that isn't a plain success, and lets you ask about it in a chat UI backed by
+real historical trend data.
 
-<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/agents-starter"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare"/></a>
+> **This project was built with AI-assisted coding (Claude Code).** The full
+> prompt history — every request made throughout development, in order — is
+> kept at [`../prompts.md`](../prompts.md). The scope brief and the
+> requirements analysis this app was built against are at
+> [`../scope.md`](../scope.md) and [`../review.md`](../review.md).
 
-A starter template for building AI chat agents on Cloudflare, powered by the [Agents SDK](https://developers.cloudflare.com/agents/).
+## Scope
 
-Uses Workers AI (no API key required), with tools for weather, timezone detection, calculations with approval, task scheduling, and vision (image input).
+The brief ([`../scope.md`](../scope.md)) asks for four things, and
+[`../review.md`](../review.md) maps them to specific Cloudflare products. This
+app's mapping:
 
-## Quick start
+| Requirement                 | What it means                                                                    | Used here                                                                                                                                                                                           |
+| --------------------------- | -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **LLM**                     | The decision engine — reasons about input and picks tool calls                   | Workers AI, **Llama 3.3** (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`), used both in the interactive chat and in the automated diagnosis step below                                                 |
+| **Workflow / coordination** | Sequences multi-step logic, retries on failure, survives longer than one request | Both layers, on purpose: the **Agents SDK** (a Durable Object) drives the non-deterministic chat loop, and a real **Cloudflare Workflow** drives the deterministic per-webhook pipeline (see below) |
+| **User input**              | A live channel for a human to send messages and get responses back               | A chat UI (Pages-style, `app.tsx`) over WebSocket — streaming, not request/response                                                                                                                 |
+| **Memory / state**          | Persistence across turns and restarts                                            | Durable Object SQLite state (fast, recent-only) **plus** D1 (durable, queryable trend history) — see [D1 is a remote resource](#d1-is-a-remote-resource) below                                      |
+
+This is deliberately narrower than a general-purpose chat agent: the system
+prompt and a pre-model guardrail both restrict it to GitHub Actions questions
+for the one connected repo. It has no weather/calculator/general-knowledge
+capability, and doesn't support other CI/CD platforms (GitLab, Jenkins,
+CircleCI, ...) — asking about those gets refused before the model is even
+called.
+
+## How it works
+
+**Webhook → Workflow (automated path).** GitHub POSTs to `/webhook` on every
+`workflow_run` and `workflow_job` event. The Worker's only job there is fast:
+verify the HMAC-SHA256 signature (`GITHUB_WEBHOOK_SECRET`), do the minimum
+parsing needed to route the event, and hand off to a Cloudflare Workflow
+(`GithubRunWorkflow`) — then return `200` immediately. Everything else runs
+inside the Workflow, as independently-retried, checkpointed steps:
+
+1. **parse** — turn the raw GitHub payload into a structured summary
+   (`src/github.ts`).
+2. **fetch** — for a job with a failed or timed-out step, fetch the raw job
+   log via the GitHub API (`GITHUB_PAT`) and keep the tail. Only runs for
+   jobs that actually failed; a plain success costs nothing here.
+3. **categorize** — compare each step's duration against its own D1 history
+   and label the job `"success"`, `"failure"`, or `"regression"`.
+4. **diagnose** — for anything other than a plain success, one Workers AI
+   call produces a 2-3 sentence diagnosis and next steps. Skipped entirely
+   for successes, so normal jobs don't spend any inference budget.
+5. **store** — write to the Durable Object's state (fast, capped recent-N
+   view, broadcasts live to any open chat session) and to D1 (durable,
+   unbounded trend history).
+
+A GitHub API hiccup during step 2 retries automatically instead of losing the
+log, and if it still fails after retrying, the job still gets recorded — the
+log excerpt is just missing, not a reason to drop the whole delivery.
+
+**Chat (interactive path).** The chat UI talks to `ChatAgent`, an Agents SDK
+Durable Object running Llama 3.3 in an agentic tool-calling loop — the model
+decides whether and which tool to call, not a fixed script. Two tools read
+back what the Workflow already computed and stored:
+
+- `getGithubWorkflowRuns` — recent run status/conclusion.
+- `getGithubJobSteps` — per-step durations, the stored `category`/`diagnosis`,
+  trend data, and (for failures) the log excerpt. Optionally filtered to one
+  run via `runId`.
+
+The chat header also has a **Trends** panel — a D1-backed sparkline view of
+the most recently active steps, independent of asking the model anything
+(`agent.stub.getStepTrends()`, a `@callable()` RPC method, no separate HTTP
+endpoint).
+
+**Guardrails.** Before the model is ever invoked: message length, profanity,
+prompt-injection phrasing, an off-topic deny-list (weather, trivia, other
+CI/CD platforms), and a sliding-window rate limit — all rejected at zero
+inference cost. Llama 3.3 (fp8-fast) intermittently leaks a tool call as raw
+text instead of calling it structurally; `onFinish` detects and salvages that
+automatically, and the resulting correction round-trip is hidden from the
+rendered chat transcript.
+
+## Required secrets
+
+Nothing GitHub-related works without these two Worker secrets:
 
 ```bash
-npx create-cloudflare@latest --template cloudflare/agents-starter
-cd agents-starter
-npm install
-npm run dev
+npx wrangler secret put GITHUB_WEBHOOK_SECRET
+npx wrangler secret put GITHUB_PAT
 ```
 
-> **Cloudflare authentication is required to run locally.** This template uses
-> Workers AI with `"ai": { "remote": true }` in `wrangler.jsonc`, and Workers AI
-> has no local simulator — so `npm run dev` opens a remote proxy session against
-> Cloudflare and needs you to be authenticated. Either run `wrangler login` once
-> in an interactive terminal, or set a `CLOUDFLARE_API_TOKEN` environment
-> variable (e.g. in a `.env` file). No third-party (OpenAI/Anthropic) key is
-> needed, but a Cloudflare login is.
+- **`GITHUB_WEBHOOK_SECRET`** — the signing secret configured on the GitHub
+  webhook itself. Every delivery is HMAC-SHA256 verified against this before
+  anything else happens; without a match, the request is rejected (`401`)
+  before it's even parsed.
+- **`GITHUB_PAT`** — a personal access token with `actions:read` (or `repo`
+  scope for a classic token). Used only to fetch job logs for a failed step
+  via the GitHub REST API — nothing else calls out to GitHub with it.
 
-Open [http://localhost:5173](http://localhost:5173) to see your agent in action.
+### Configuring the webhook on GitHub
 
-Try these prompts to see the different features:
+In the target repo: **Settings → Webhooks → Add webhook**
 
-- **"What's the weather in Paris?"** — server-side tool (runs automatically)
-- **"What timezone am I in?"** — client-side tool (browser provides the answer)
-- **"Calculate 5000 \* 3"** — approval tool (asks you before running)
-- **"Remind me in 5 minutes to take a break"** — scheduling
-- **Drop an image and ask "What's in this image?"** — vision (image understanding)
+- **Payload URL**: `https://<your-worker>.<subdomain>.workers.dev/webhook`
+- **Content type**: `application/json` (form-encoded is also supported, but
+  JSON is simpler)
+- **Secret**: the same value as `GITHUB_WEBHOOK_SECRET`
+- **Events**: select "Workflow runs" and "Workflow jobs" (or "Send me
+  everything" — other event types are safely ignored and return `200` with
+  no processing)
+
+## D1 is a remote resource
+
+The D1 database (`step_runs` table — trend/regression history) is a real,
+hosted database in your Cloudflare account, **not a local file**. Provisioning
+it and applying the schema are one-time setup steps against your account:
+
+```bash
+npx wrangler d1 create github-action-assistant-db
+# paste the printed database_id into wrangler.jsonc's d1_databases[0].database_id
+npx wrangler d1 migrations apply github-action-assistant-db --remote
+```
+
+`npm run dev` (via the Cloudflare Vite plugin) uses a **separate, local** D1
+instance for fast iteration — apply the same migration with `--local` to set
+that up too:
+
+```bash
+npx wrangler d1 migrations apply github-action-assistant-db --local
+```
+
+Local and remote D1 do not sync. Trend data you generate while running
+`npm run dev` locally never appears in the deployed app, and vice versa —
+each environment builds its own history independently.
+
+## Setup
+
+```bash
+npm install
+npx wrangler login                 # Workers AI has no local simulator
+cp .dev.vars.example .dev.vars     # local secrets for npm run dev
+npx wrangler secret put GITHUB_WEBHOOK_SECRET
+npx wrangler secret put GITHUB_PAT
+npx wrangler d1 create github-action-assistant-db   # then update wrangler.jsonc
+npx wrangler d1 migrations apply github-action-assistant-db --remote
+npx wrangler d1 migrations apply github-action-assistant-db --local
+npm run deploy
+```
+
+Then add the webhook on GitHub as described above, pointing at your deployed
+Worker's `/webhook` URL.
+
+## Local development & testing
+
+```bash
+npm run dev   # http://localhost:5173
+```
+
+`fixtures/` has real-shaped GitHub webhook payloads — `workflow_run` and
+`workflow_job` across their full lifecycle (queued/in_progress/completed) and
+conclusions (success/failure/timed_out/cancelled/skipped), plus edge cases
+(malformed JSON, an oversized body, form-urlencoded content type, ignored
+event types). `scripts/` replays them with a correctly computed HMAC
+signature, so they exercise the real verification path instead of bypassing
+it:
+
+```bash
+# Send one fixture as a specific event
+scripts/send-webhook-fixture.sh workflow_job fixtures/workflow_job-completed-failure.json
+
+# Run every transport/security edge case and check the expected HTTP status
+scripts/send-webhook-edge-cases.sh
+
+# See what actually landed, bypassing the LLM entirely
+curl -s http://localhost:5173/webhook/status | jq
+npx wrangler d1 execute github-action-assistant-db --local \
+  --command "SELECT * FROM step_runs ORDER BY id DESC LIMIT 20"
+```
 
 ## Project structure
 
 ```
 src/
-  server.ts    # Chat agent with tools and scheduling
-  app.tsx      # Chat UI built with Kumo components
-  client.tsx   # React entry point
-  styles.css   # Tailwind + Kumo styles
+  server.ts           # ChatAgent (Durable Object): chat loop, tools,
+                      # guardrails, webhook entry point (verify + hand off
+                      # to the Workflow)
+  github.ts           # Pure logic: payload parsing, sanitization, D1
+                      # queries — shared by server.ts and
+                      # github-workflow.ts, no Workers-only imports
+  github-workflow.ts  # GithubRunWorkflow: the fetch/parse/categorize/
+                      # diagnose/store pipeline
+  shared.ts           # The one constant shared with the browser bundle
+  app.tsx             # Chat UI (Kumo components): messages, Trends panel,
+                      # MCP panel
+  client.tsx          # React entry point
+migrations/           # D1 schema
+fixtures/             # Sample webhook payloads for local testing
+scripts/              # Fixture-replay and edge-case test runners
 ```
 
-## What's included
+## Known limitations
 
-- **AI Chat** — Streaming responses powered by Workers AI via `AIChatAgent`
-- **Image input** — Drag-and-drop, paste, or click to attach images for vision-capable models
-- **Three tool patterns** — server-side auto-execute, client-side (browser), and human-in-the-loop approval
-- **Scheduling** — one-time, delayed, and recurring (cron) tasks
-- **Reasoning display** — shows model thinking as it streams, collapses when done
-- **Debug mode** — toggle in the header to inspect raw message JSON for each message
-- **Kumo UI** — Cloudflare's design system with dark/light mode
-- **Real-time** — WebSocket connection with automatic reconnection and message persistence
-
-## Making it your own
-
-### Name your project
-
-Update the name in `package.json` and `wrangler.jsonc` — the `name` in `wrangler.jsonc` becomes your deployed Worker's URL (`<name>.<subdomain>.workers.dev`).
-
-### Change the system prompt
-
-Edit the `system` string in `server.ts` to give your agent a different personality or focus area. This is the most impactful single change you can make.
-
-### Replace the demo tools with real ones
-
-The starter ships with demo tools (`getWeather` returns random data, `calculate` does basic arithmetic). Replace them with real implementations:
-
-```ts
-// In server.ts, replace a demo tool with a real API call:
-getWeather: tool({
-  description: "Get the current weather for a city",
-  inputSchema: z.object({ city: z.string() }),
-  execute: async ({ city }) => {
-    const res = await fetch(`https://api.weather.example/${city}`);
-    return res.json();
-  }
-}),
-```
-
-### Add your own tools
-
-Add new tools to the `tools` object in `server.ts`. There are three patterns:
-
-```ts
-// Auto-execute: runs on the server, no user interaction
-myTool: tool({
-  description: "...",
-  inputSchema: z.object({ /* ... */ }),
-  execute: async (input) => { /* return result */ }
-}),
-
-// Client-side: no execute function, browser provides the result
-// Handle it in app.tsx via the onToolCall callback
-browserTool: tool({
-  description: "...",
-  inputSchema: z.object({ /* ... */ })
-}),
-
-// Approval: add needsApproval to gate execution
-sensitiveTool: tool({
-  description: "...",
-  inputSchema: z.object({ /* ... */ }),
-  needsApproval: async (input) => true, // or conditional logic
-  execute: async (input) => { /* runs after approval */ }
-}),
-```
-
-### Customize scheduled task behavior
-
-When a scheduled task fires, `executeTask` runs on the server. It does its work and then uses `this.broadcast()` to notify connected clients (shown as a toast notification in the UI). Replace it with your own logic:
-
-```ts
-async executeTask(description: string, task: Schedule<string>) {
-  // Do the actual work
-  await sendEmail({ to: "user@example.com", subject: description });
-
-  // Notify connected clients
-  this.broadcast(
-    JSON.stringify({ type: "scheduled-task", description, timestamp: new Date().toISOString() })
-  );
-}
-```
-
-> **Why `broadcast()` instead of `saveMessages()`?** Injecting into chat history can cause the AI to see the notification as new context and re-trigger the same task in a loop. `broadcast()` sends a one-off event that the client displays separately from the conversation.
-
-### Remove scheduling
-
-If you don't need scheduling, remove `scheduleTask`, `getScheduledTasks`, and `cancelScheduledTask` from the tools object, the `executeTask` method, and the schedule-related imports (`getSchedulePrompt`, `scheduleSchema`, `Schedule`).
-
-### Add state beyond chat messages
-
-Use `this.setState()` and `this.state` for real-time state that syncs to all connected clients. See [Store and sync state](https://developers.cloudflare.com/agents/api-reference/store-and-sync-state/).
-
-### Add callable methods
-
-Expose agent methods as typed RPC that your client can call directly:
-
-```ts
-import { callable } from "agents";
-
-export class ChatAgent extends AIChatAgent<Env> {
-  @callable()
-  async getStats() {
-    return { messageCount: this.messages.length };
-  }
-}
-
-// Client-side:
-const stats = await agent.call("getStats");
-```
-
-See [Callable methods](https://developers.cloudflare.com/agents/api-reference/callable-methods/).
-
-### Connect to MCP servers
-
-Add external tools from MCP servers:
-
-```ts
-async onChatMessage(onFinish, options) {
-  // Connect to an MCP server
-  await this.mcp.connect("https://my-mcp-server.example/sse");
-
-  const result = streamText({
-    // ...
-    tools: {
-      ...myTools,
-      ...this.mcp.getAITools() // Include MCP tools
-    }
-  });
-}
-```
-
-See [MCP Client API](https://developers.cloudflare.com/agents/api-reference/mcp-client-api/).
-
-## Use a different AI model provider
-
-The starter uses [Workers AI](https://developers.cloudflare.com/workers-ai/) by default (no API key needed). To use a different provider:
-
-### OpenAI
-
-```bash
-npm install @ai-sdk/openai
-```
-
-```ts
-// In server.ts, replace the model:
-import { openai } from "@ai-sdk/openai";
-
-// Inside onChatMessage:
-const result = streamText({
-  model: openai("gpt-5.2")
-  // ...
-});
-```
-
-Create a `.env` file with your API key:
-
-```
-OPENAI_API_KEY=your-key-here
-```
-
-### Anthropic
-
-```bash
-npm install @ai-sdk/anthropic
-```
-
-```ts
-import { anthropic } from "@ai-sdk/anthropic";
-
-const result = streamText({
-  model: anthropic("claude-sonnet-4-20250514")
-  // ...
-});
-```
-
-Create a `.env` file with your API key:
-
-```
-ANTHROPIC_API_KEY=your-key-here
-```
-
-## Deploy
-
-```bash
-npm run deploy
-```
-
-Your agent is live on Cloudflare's global network. Messages persist in SQLite, streams resume on disconnect, and the agent hibernates when idle.
-
-## Learn more
-
-- [Agents SDK documentation](https://developers.cloudflare.com/agents/)
-- [Build a chat agent tutorial](https://developers.cloudflare.com/agents/getting-started/build-a-chat-agent/)
-- [Chat agents API reference](https://developers.cloudflare.com/agents/api-reference/chat-agents/)
-- [Workers AI models](https://developers.cloudflare.com/workers-ai/models/)
+- **No output delivery back to GitHub yet.** `GITHUB_PAT` is read-only in
+  this app — nothing posts a PR/commit comment with the diagnosis. The
+  diagnosis currently only surfaces in the chat UI.
+- **No proactive notification.** A completed job broadcasts to any open chat
+  session, but the client doesn't yet turn that into a toast/alert — you have
+  to ask, or open the Trends panel.
+- `pre-log.json` / `post-log.json` at the repo root are empty legacy
+  placeholders, superseded by `fixtures/`.
 
 ## License
 

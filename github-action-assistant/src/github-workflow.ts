@@ -68,14 +68,27 @@ export class GithubRunWorkflow extends WorkflowEntrypoint<
     // raw log tail. Retries are declared here instead of hand-rolled
     // try/catch, since that's the whole point of moving this into a
     // Workflow — a transient GitHub API hiccup shouldn't lose the log.
+    // If it still fails after every retry (bad PAT, GitHub outage, or the
+    // job/repo genuinely has no logs), that's a reason to skip the excerpt,
+    // not a reason to fail the whole run — categorize/diagnose/store below
+    // still need to happen even without one.
     const failureExcerpt = hasFailedStep
-      ? await step.do(
-          "fetch-failure-log",
-          {
-            retries: { limit: 3, delay: "10 seconds", backoff: "exponential" }
-          },
-          () => fetchJobLogExcerpt(this.env.GITHUB_PAT, job.repo, job.jobId)
-        )
+      ? await step
+          .do(
+            "fetch-failure-log",
+            {
+              retries: {
+                limit: 3,
+                delay: "10 seconds",
+                backoff: "exponential"
+              }
+            },
+            () => fetchJobLogExcerpt(this.env.GITHUB_PAT, job.repo, job.jobId)
+          )
+          .catch((error: unknown) => {
+            console.error("Failed to fetch failure log after retries", error);
+            return undefined;
+          })
       : undefined;
 
     // categorize: attach each step's historical trend so categorization
